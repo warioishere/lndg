@@ -10,6 +10,17 @@ from gui.lnd_deps import router_pb2_grpc as lnrouter
 from gui.lnd_deps.lnd_connect import lnd_connect, async_lnd_connect
 from os import environ
 from typing import List
+from django.db import models
+
+class CachedRoute(models.Model):
+    last_hop_pubkey = models.CharField(max_length=66)
+    outgoing_chan_ids = models.TextField()  # JSON-serialisierte Liste von Channel-IDs
+    last_successful_rebalance = models.DateTimeField(auto_now=True)
+    success_count = models.PositiveIntegerField(default=1)  # Anzahl der erfolgreichen Nutzungen
+    fail_count = models.PositiveIntegerField(default=0)  # Anzahl der Fehlschlaege
+
+    def __str__(self):
+        return f"Route to {self.last_hop_pubkey}"
 
 environ['DJANGO_SETTINGS_MODULE'] = 'lndg.settings'
 django.setup()
@@ -50,11 +61,31 @@ def check_and_set_allow_multishards():
     
     return allow_multishards
 
+@sync_to_async
+def get_cached_route(last_hop_pubkey):
+    return CachedRoute.objects.filter(
+        last_hop_pubkey=last_hop_pubkey, fail_count__lt=3
+    ).order_by('-success_count').first()
+
+@sync_to_async
+def cleanup_old_routes():
+    expiry_time = datetime.now() - timedelta(days=7)  # Beispiel: älter als 7 Tage löschen
+    CachedRoute.objects.filter(last_successful_rebalance__lt=expiry_time).delete()
+
 async def run_rebalancer(rebalance, worker):
     try:
         # Check if LocalSetting LND-EnableMPP exists and set allow_mpp accordingly
         allow_multishards = await check_and_set_allow_multishards()  # Default value is True.
         max_parts = None if allow_multishards else 1  # Adjust max_parts based on the allow_multishards value
+
+        # Im Cache nach einer bestehenden Route suchen
+        cached_route = await get_cached_route(rebalance.last_hop_pubkey)
+
+        if cached_route:
+                rebalance.outgoing_chan_ids = json.loads(cached_route.outgoing_chan_ids)
+                print(f"{datetime.now().strftime('%c')} : [Rebalancer] : Verwende zwischengespeicherte Route für {rebalance.last_hop_pubkey}")
+        else:
+                print(f"{datetime.now().strftime('%c')} : [Rebalancer] : Keine zwischengespeicherte Route gefunden, Netzwerksuche wird durchgeführt")
         #Reduce potential rebalance value in percent out to avoid going below AR-OUT-Target
         auto_rebalance_channels = Channels.objects.filter(is_active=True, is_open=True, private=False).annotate(percent_outbound=((Sum('local_balance')+Sum('pending_outbound')-rebalance.value)*100)/Sum('capacity')).annotate(inbound_can=(((Sum('remote_balance')+Sum('pending_inbound'))*100)/Sum('capacity'))/Sum('ar_in_target'))
         outbound_cans = await get_out_cans(rebalance, auto_rebalance_channels)
@@ -87,6 +118,17 @@ async def run_rebalancer(rebalance, worker):
                     rebalance.status = 2
                     rebalance.fees_paid = payment_response.fee_msat/1000
                     successful_out = payment_response.htlcs[0].route.hops[0].pub_key
+                
+                    # Route erfolgreich, in Cache speichern
+                    cached_route, created = await sync_to_async(CachedRoute.objects.get_or_create)(
+                        last_hop_pubkey=rebalance.last_hop_pubkey,
+                        defaults={"outgoing_chan_ids": json.dumps(rebalance.outgoing_chan_ids)}
+                    )
+                    if not created:
+                        cached_route.success_count += 1
+                    cached_route.last_successful_rebalance = datetime.now()
+                    await save_record(cached_route)
+
                 elif payment_response.status == 3:
                     #FAILURE
                     if payment_response.failure_reason == 1:
@@ -104,6 +146,18 @@ async def run_rebalancer(rebalance, worker):
                     elif payment_response.failure_reason == 5:
                         #FAILURE_REASON_INSUFFICIENT_BALANCE
                         rebalance.status = 7
+                    
+                    cached_route = await sync_to_async(CachedRoute.objects.filter)(
+                        last_hop_pubkey=rebalance.last_hop_pubkey
+                    ).first()
+                    if cached_route:
+                        cached_route.fail_count += 1
+                        if cached_route.fail_count >= 3:
+                                print(f"{datetime.now().strftime('%c')} : [Rebalancer] : Route wurde 3 Mal fehlerhaft, wird aus dem Cache entfernt.")
+                                await sync_to_async(cached_route.delete)()  # Route löschen
+                        else:
+                                await save_record(cached_route)
+
                 elif payment_response.status == 0:
                     rebalance.status = 400
         except Exception as e:
